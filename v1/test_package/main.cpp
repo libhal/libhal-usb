@@ -32,7 +32,7 @@ void pump(async::future<T>& p_future, hal::usize p_max_steps = 50)
 class stub_control_endpoint : public hal::usb::control_endpoint
 {
 public:
-  ~stub_control_endpoint() override = default;
+  ~stub_control_endpoint() = default;
 
   hal::usize m_connect_calls = 0;
 
@@ -114,7 +114,7 @@ private:
 class stub_interface : public hal::usb::interface
 {
 public:
-  ~stub_interface() override = default;
+  ~stub_interface() = default;
 
 private:
   async::future<descriptor_count> driver_write_descriptors(

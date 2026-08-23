@@ -51,7 +51,7 @@ void pump(async::future<T>& p_future, hal::usize p_max_steps = 500)
 export class mock_control_endpoint : public hal::usb::control_endpoint
 {
 public:
-  ~mock_control_endpoint() override = default;
+  ~mock_control_endpoint() = default;
 
   void set_read_data(std::span<hal::byte const> p_data)
   {
@@ -225,7 +225,7 @@ private:
 export class mock_interface : public hal::usb::interface
 {
 public:
-  ~mock_interface() override = default;
+  ~mock_interface() = default;
 
   bool m_handle_request_result = false;
   bool m_write_string_result = false;

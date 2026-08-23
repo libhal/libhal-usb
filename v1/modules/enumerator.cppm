@@ -458,24 +458,27 @@ private:
     co_await dispatch_setup_packet(p_context, request);
   }
 
+  // Not a coroutine: every branch hands off to exactly one async call and
+  // does nothing else, so this can return that call's future directly
+  // instead of paying for its own coroutine frame/resume state to just
+  // await and immediately finish.
   hal::task dispatch_setup_packet(async::context& p_context,
                                    setup_packet& p_request)
   {
     switch (p_request.get_recipient()) {
       case setup_packet::request_recipient::invalid:
-        co_await send_error_to_host(p_context);
-        break;
+        return send_error_to_host(p_context);
 
       case setup_packet::request_recipient::device:
-        co_await handle_standard_device_request(p_context, p_request);
-        break;
+        return handle_standard_device_request(p_context, p_request);
 
       case setup_packet::request_recipient::interface:
         [[fallthrough]];
       case setup_packet::request_recipient::endpoint:
-        co_await handle_interface_request(p_context, p_request);
-        break;
+        return handle_interface_request(p_context, p_request);
     }
+
+    return {};
   }
 
   hal::task handle_interface_request(async::context& p_context,

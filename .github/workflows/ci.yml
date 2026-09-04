@@ -13,11 +13,11 @@ jobs:
   library_check_v5:
     uses: libhal/ci/.github/workflows/library_check.yml@5.x.y
     with:
-      dir: v5
+      dir: v1
     secrets: inherit
 
   deployment_check_v5:
     uses: libhal/ci/.github/workflows/package_and_upload_all.yml@5.x.y
     with:
-      dir: v5
+      dir: v1
     secrets: inherit

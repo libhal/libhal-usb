@@ -10,7 +10,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     uses: libhal/ci/.github/workflows/package_and_upload_all.yml@5.x.y
     with:
-      dir: v5
+      dir: v1
       version: ${{ github.ref_name }}
       remote_url: https://libhal.jfrog.io/artifactory/api/conan/trunk-conan
     secrets: inherit

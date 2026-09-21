@@ -405,7 +405,7 @@ private:
     async::future<usize> driver_read(async::context& p_context,
                                       mem::scatter_span<byte> p_buffer) override
     {
-      co_return co_await m_ctrl_ep->read(p_context, p_buffer);
+      return m_ctrl_ep->read(p_context, p_buffer);
     }
 
     async::future<usize> driver_write(
@@ -426,7 +426,7 @@ private:
     async::future<usize> driver_read(async::context&,
                                       mem::scatter_span<byte>) override
     {
-      co_return 0;
+      return async::future<usize>(0);
     }
 
     async::future<usize> driver_write(
@@ -435,7 +435,7 @@ private:
     {
       auto const length = p_buffer.length();
       total_length += length;
-      co_return length;
+      return async::future<usize>(length);
     }
 
     usize total_length = 0;
@@ -501,10 +501,14 @@ private:
     co_await m_ctrl_ep->write(p_context, {});
   }
 
+  // The increment is reordered ahead of the stall so this can tail-forward
+  // its future directly. Behaviorally equivalent even if stall() throws -
+  // run() only ever exits by propagating an exception, so nothing ever
+  // reads m_retry_counter again once that happens either way.
   hal::task send_error_to_host(async::context& p_context)
   {
-    co_await m_ctrl_ep->stall(p_context, true);
     m_retry_counter += 1;
+    return m_ctrl_ep->stall(p_context, true);
   }
 
   hal::task handle_standard_device_request(async::context& p_context,
@@ -842,6 +846,12 @@ private:
     co_await send_error_to_host(p_context);
   }
 
+  // TODO(#3): `header` below is a stack-local borrowed by `payload` across
+  // the co_await, which is what keeps this a coroutine (a whole ramp/resume
+  // /destroy triple for one tail call). Hoisting it to a member would let
+  // this collapse to `return write_and_flush(...);` - see issue for the
+  // one caveat to confirm first (the three call sites in
+  // handle_str_descriptors must not have overlapping in-flight uses of it).
   hal::task write_string_view(async::context& p_context,
                                std::u16string_view p_str,
                                u16 p_max_length)

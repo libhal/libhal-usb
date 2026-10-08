@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #include <array>
-#include <coroutine>
 #include <span>
 
 #include <boost/ut.hpp>
@@ -42,19 +41,15 @@ private:
     return { .size = 64, .number = 0x81, .stalled = false };
   }
 
-  async::future<void> driver_stall(async::context&, bool) override
+  void driver_stall(bool) override
   {
-    return {};
   }
 
-  async::future<void> driver_reset(async::context&) override
+  void driver_reset() override
   {
-    return {};
   }
 
-  async::future<void> driver_write(
-    async::context&,
-    mem::scatter_span<hal::byte const> p_data) override
+  void driver_write(mem::scatter_span<hal::byte const> p_data) override
   {
     ++m_write_calls;
     m_last_write_was_zlp = (p_data.length() == 0);
@@ -65,7 +60,6 @@ private:
         }
       }
     }
-    return {};
   }
 };
 
@@ -88,40 +82,34 @@ private:
     return { .size = 8, .number = 0x01, .stalled = false };
   }
 
-  async::future<void> driver_stall(async::context&, bool) override
+  void driver_stall(bool) override
   {
-    return {};
   }
 
-  async::future<void> driver_reset(async::context&) override
+  void driver_reset() override
   {
-    return {};
   }
 
-  async::future<void> driver_on_receive(async::context&) override
+  void driver_on_receive(
+    mem::optional_ptr<hal::usb::receive_callback> const&) override
   {
-    return {};
   }
 
-  async::future<hal::usize> driver_read(
-    async::context&,
-    mem::scatter_span<hal::byte> p_buffer) override
+  hal::usize driver_read(mem::scatter_span<hal::byte> p_buffer) override
   {
     hal::usize written = 0;
     for (auto chunk : p_buffer) {
       for (auto& b : chunk) {
         if (written >= m_available) {
-          co_return written;
+          return written;
         }
         b = m_source[written++];
       }
     }
     m_available = 0;
-    co_return written;
+    return written;
   }
 };
-
-async::inplace_context<1024> ctx;
 
 void control_endpoint_write_test()
 {
@@ -133,9 +121,7 @@ void control_endpoint_write_test()
     std::array<hal::byte, 3> const data{ 1, 2, 3 };
 
     // Exercise
-    auto future =
-      hal::usb::write(ctx, endpoint, mem::scatter_span<hal::byte const>{ data });
-    hal::usb::test::pump(future);
+    hal::usb::write(endpoint, mem::scatter_span<hal::byte const>{ data });
 
     // Verify
     expect(that % 1 == endpoint.m_write_call_count);
@@ -149,9 +135,7 @@ void control_endpoint_write_test()
     std::array<hal::byte, 2> const data{ 9, 8 };
 
     // Exercise
-    auto future = hal::usb::write_and_flush(
-      ctx, endpoint, std::span<hal::byte const>(data));
-    hal::usb::test::pump(future);
+    hal::usb::write_and_flush(endpoint, std::span<hal::byte const>(data));
 
     // Verify
     expect(that % 2 == endpoint.m_write_call_count);
@@ -170,9 +154,7 @@ void in_endpoint_write_test()
     std::array<hal::byte, 4> const data{ 1, 2, 3, 4 };
 
     // Exercise
-    auto future =
-      hal::usb::write(ctx, endpoint, mem::scatter_span<hal::byte const>{ data });
-    hal::usb::test::pump(future);
+    hal::usb::write(endpoint, mem::scatter_span<hal::byte const>{ data });
 
     // Verify
     expect(that % 1 == endpoint.m_write_calls);
@@ -186,9 +168,7 @@ void in_endpoint_write_test()
     std::array<hal::byte, 2> const data{ 5, 6 };
 
     // Exercise
-    auto future = hal::usb::write_and_flush(
-      ctx, endpoint, std::span<hal::byte const>(data));
-    hal::usb::test::pump(future);
+    hal::usb::write_and_flush(endpoint, std::span<hal::byte const>(data));
 
     // Verify
     expect(that % 2 == endpoint.m_write_calls);
@@ -202,8 +182,7 @@ void in_endpoint_write_test()
     std::array<hal::byte, 3> const body{ 1, 2, 3 };
 
     // Exercise
-    auto future = hal::usb::write(ctx, endpoint, header, body);
-    hal::usb::test::pump(future);
+    hal::usb::write(endpoint, header, body);
 
     // Verify
     expect(that % 1 == endpoint.m_write_calls);
@@ -225,12 +204,11 @@ void out_endpoint_read_test()
     std::array<hal::byte, 8> buffer{};
 
     // Exercise
-    auto future = hal::usb::read(
-      ctx, endpoint, mem::scatter_span<hal::byte>{ std::span(buffer) });
-    hal::usb::test::pump(future);
+    auto const bytes_read = hal::usb::read(
+      endpoint, mem::scatter_span<hal::byte>{ std::span(buffer) });
 
     // Verify
-    expect(that % 3 == future.value());
+    expect(that % 3 == bytes_read);
     expect(hal::byte{ 7 } == buffer[0]);
     expect(hal::byte{ 9 } == buffer[2]);
   };
@@ -243,11 +221,11 @@ void out_endpoint_read_test()
     std::array<hal::byte, 8> buffer{};
 
     // Exercise
-    auto future = hal::usb::read(ctx, endpoint, std::span<hal::byte>(buffer));
-    hal::usb::test::pump(future);
+    auto const bytes_read =
+      hal::usb::read(endpoint, std::span<hal::byte>(buffer));
 
     // Verify
-    expect(that % 2 == future.value());
+    expect(that % 2 == bytes_read);
     expect(hal::byte{ 4 } == buffer[0]);
   };
 }
@@ -264,11 +242,11 @@ void control_endpoint_read_test()
     std::array<hal::byte, 8> buffer{};
 
     // Exercise
-    auto future = hal::usb::read(ctx, endpoint, std::span<hal::byte>(buffer));
-    hal::usb::test::pump(future);
+    auto const bytes_read =
+      hal::usb::read(endpoint, std::span<hal::byte>(buffer));
 
     // Verify
-    expect(that % 8 == future.value());
+    expect(that % 8 == bytes_read);
     expect(hal::byte{ 1 } == buffer[0]);
     expect(hal::byte{ 8 } == buffer[7]);
   };

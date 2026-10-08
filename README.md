@@ -15,9 +15,12 @@ The `hal::usb::enumerator`, descriptor-construction, and endpoint I/O helper
 code in this repository originated as `libhal-util`'s own
 `include/libhal-util/usb/` directory (`constants.hpp`, `descriptors.hpp`,
 `endpoints.hpp`, `enumerator.hpp`) in `libhal-util` v5. It was split out into
-this standalone package and rewritten against the async, coroutine-based
-`hal::usb` interfaces (`hal::usb::control_endpoint`, `in_endpoint`,
-`out_endpoint`, `interface`) shipped by `libhal` v5's core `usb` module.
+this standalone package and rewritten against the `hal::usb` interfaces
+(`hal::usb::control_endpoint`, `in_endpoint`, `out_endpoint`, `interface`)
+shipped by `libhal` v5's core `usb` module, first in their async,
+coroutine-based form and later in their synchronous, callback-based form.
+The enumerator is driven by calling `hal::usb::enumerator::poll()` from the
+application's main loop or from a task dedicated to USB.
 
 ## 📚 Software APIs & Usage
 
@@ -113,11 +116,11 @@ interface.
 We define a "behavior change" as an intentional change to the documentation of
 a public API that would change the API's behavior such that previous and later
 versions of the same API would do observably different things. For example,
-consider a call to `hal::usb::enumerator::run(context)`. If the description
-for this API was changed from, "loops forever processing bus events" to
-"processes a single pending bus event and returns", that would be a
-behavioral change, since code relying on `run()` to drive enumeration forever
-would no longer work correctly.
+consider a call to `hal::usb::enumerator::poll()`. If the description for
+this API was changed from, "handles every queued bus event and returns" to
+"handles a single queued bus event and returns", that would be a behavioral
+change, since code calling `poll()` once per loop iteration and expecting the
+queue to drain would fall behind.
 
 The usage of the term "intentional" means that the break or behavior change was
 expected and accepted for a release. If an API break occurs on accident when it

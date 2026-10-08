@@ -26,7 +26,9 @@ namespace {
 
 struct test_bulk_in_endpoint : public hal::usb::bulk_in_endpoint
 {
-  hal::usb::endpoint_info m_info{ .size = 64, .number = 0x81, .stalled = false };
+  hal::usb::endpoint_info m_info{ .size = 64,
+                                  .number = 0x81,
+                                  .stalled = false };
 
 private:
   [[nodiscard]] hal::usb::endpoint_info driver_info() const override
@@ -34,20 +36,16 @@ private:
     return m_info;
   }
 
-  async::future<void> driver_stall(async::context&, bool) override
+  void driver_stall(bool) override
   {
-    return {};
   }
 
-  async::future<void> driver_reset(async::context&) override
+  void driver_reset() override
   {
-    return {};
   }
 
-  async::future<void> driver_write(async::context&,
-                                    mem::scatter_span<hal::byte const>) override
+  void driver_write(mem::scatter_span<hal::byte const>) override
   {
-    return {};
   }
 };
 
@@ -101,12 +99,12 @@ void endpoint_descriptor_test()
     expect(that % hal::usb::constants::endpoint_descriptor_size ==
            descriptor.size());
     expect(that % descriptor.size() == descriptor[0]);
-    expect(that % 0x05 == descriptor[1]);   // b_descriptor_type == endpoint
-    expect(that % 0x81 == descriptor[2]);   // b_endpoint_address
-    expect(that % 0x02 == descriptor[3]);   // bm_attributes == bulk
-    expect(that % 64 == descriptor[4]);     // w_max_packet_size low byte
-    expect(that % 0 == descriptor[5]);      // w_max_packet_size high byte
-    expect(that % 10 == descriptor[6]);     // b_interval
+    expect(that % 0x05 == descriptor[1]);  // b_descriptor_type == endpoint
+    expect(that % 0x81 == descriptor[2]);  // b_endpoint_address
+    expect(that % 0x02 == descriptor[3]);  // bm_attributes == bulk
+    expect(that % 64 == descriptor[4]);    // w_max_packet_size low byte
+    expect(that % 0 == descriptor[5]);     // w_max_packet_size high byte
+    expect(that % 10 == descriptor[6]);    // b_interval
   };
 }
 

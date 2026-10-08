@@ -16,7 +16,6 @@ module;
 
 #include <algorithm>
 #include <array>
-#include <coroutine>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -263,9 +262,28 @@ public:
     , m_interfaces(p_interfaces)
     , m_info(p_info)
   {
+    // Hardware delivers a real bus_event::reset when the host begins
+    // enumeration, but that event may arrive before the callback below is
+    // installed. Prime a reset so the first poll() is guaranteed to connect
+    // even if no reset event is ever observed.
+    m_bus_events.callback(bus_event::reset);
+    m_ctrl_ep->on_bus_event(hal::ptr<bus_event_callback>(
+      mem::unsafe_assume_static_tag{}, m_bus_events));
   }
 
-  ~enumerator() = default;
+  /**
+   * @brief Detach from the control endpoint's bus events.
+   *
+   * The control endpoint holds a non-owning pointer to this enumerator's event
+   * queue, so it must be removed before the queue is destroyed.
+   */
+  ~enumerator()
+  {
+    m_ctrl_ep->on_bus_event(mem::optional_ptr<bus_event_callback>{});
+  }
+
+  enumerator(enumerator const&) = delete;
+  enumerator& operator=(enumerator const&) = delete;
 
   enumerator(enumerator&&) = delete;
   enumerator& operator=(enumerator&&) = delete;
@@ -287,105 +305,159 @@ public:
   }
 
   /**
-   * @brief Run the USB enumeration and control-transfer event loop.
+   * @brief Process the USB bus events reported since the last call.
    *
-   * This coroutine suspends on the control endpoint's `on_bus_event()` and
-   * reacts as bus events arrive: reset events trigger device reconnection,
-   * setup packets are dispatched to the request handler, and suspend/
-   * resume/sleep events are forwarded to registered interfaces. It loops
-   * forever, driving the full lifetime of USB enumeration and control
-   * traffic for this device.
+   * The control endpoint reports bus events from its interrupt. The enumerator
+   * queues them and handles them here, in the calling context: reset events
+   * reconnect the device, setup packets are dispatched to the request handler,
+   * and suspend/resume/sleep events are forwarded to registered interfaces.
+   * The first call connects the device to the host.
    *
-   * The caller is expected to drive this coroutine to completion via a
-   * scheduler — either as the sole coroutine on an `async::context` (via
-   * `context::sync_wait()`/`async::run_until_done()`), or `co_await`-ed
-   * from within a larger application coroutine. It only returns if an
-   * exception propagates out of it.
+   * Call this regularly, either from the application's main loop or from a
+   * task dedicated to USB. Handling a setup packet performs blocking control
+   * transfers, so a call can block for the duration of one control transfer.
+   * Returns once every queued event has been handled.
+   *
+   * Up to 7 events can be queued between calls. If more arrive, the newest
+   * are dropped and the loss is counted as a protocol error. The host retries
+   * control transfers that go unanswered, so a dropped setup packet recovers
+   * on its own.
    *
    * A retry counter tracks protocol errors; if the counter reaches the
    * configured maximum, an `io_error` is thrown as a safety mechanism to
    * prevent infinite error loops.
    *
-   * @param p_context - async context for coroutine suspension and
-   * resumption.
-   * @throws hal::io_error if the retry counter exceeds the configured
-   * maximum.
+   * Must not be called from an interrupt service routine.
+   *
+   * @throws hal::io_error if the retry counter reaches the configured maximum.
    */
-  hal::task run(async::context& p_context)
+  void poll()
   {
-    // Hardware delivers a real bus_event::reset when the host begins
-    // enumeration, but that event may not arrive before this coroutine
-    // starts running. Prime the connection once up front so `connect()` is
-    // guaranteed to happen even if no reset event is ever observed.
-    co_await handle_reset(p_context);
+    if (m_bus_events.take_overflow()) {
+      m_retry_counter += 1;
+      check_retry_limit();
+    }
 
-    while (true) {
-      if (m_retry_counter >= m_info.retry_max) {
-        m_retry_counter = 0;
-        throw hal::io_error(this);
-      }
-
-      auto const event = co_await m_ctrl_ep->on_bus_event(p_context);
+    while (auto const event = m_bus_events.pop()) {
       auto const previous_retry_count = m_retry_counter;
-
-      switch (event) {
-        case hal::usb::bus_event::reset:
-          co_await handle_reset(p_context);
-          break;
-        case hal::usb::bus_event::setup_packet:
-          co_await handle_setup_packet(p_context);
-          break;
-        case hal::usb::bus_event::data_packet:
-          break;
-        case hal::usb::bus_event::resume:
-          co_await pass_host_event_to_interfaces(p_context, host_event::resume);
-          break;
-        case hal::usb::bus_event::suspend: {
-          bool const wakeup_granted =
-            co_await m_ctrl_ep->remote_wakeup_granted(p_context);
-          if (wakeup_granted) {
-            co_await pass_host_event_to_interfaces(
-              p_context, host_event::suspend_with_wakeup);
-          } else {
-            co_await pass_host_event_to_interfaces(
-              p_context, host_event::suspend_without_wakeup);
-          }
-          break;
-        }
-        case hal::usb::bus_event::sleep:
-          co_await pass_host_event_to_interfaces(p_context, host_event::sleep);
-          break;
-        case hal::usb::bus_event::u1_sleep:
-          co_await pass_host_event_to_interfaces(p_context,
-                                                  host_event::u1_sleep);
-          break;
-        case hal::usb::bus_event::u2_sleep:
-          co_await pass_host_event_to_interfaces(p_context,
-                                                  host_event::u2_sleep);
-          break;
-      }
+      handle_bus_event(*event);
 
       // If the retry count hasn't increased, then communication was
       // successful and we can reset the retry counter.
       if (previous_retry_count == m_retry_counter) {
         m_retry_counter = 0;
+      } else {
+        check_retry_limit();
       }
     }
   }
 
 private:
-  hal::task handle_reset(async::context& p_context)
+  /**
+   * @brief Single-producer, single-consumer queue of bus events.
+   *
+   * The control endpoint's interrupt is the only producer (`callback()`) and
+   * `poll()` is the only consumer (`pop()`). The storage and indices are
+   * volatile so the compiler neither caches nor reorders either side's
+   * accesses. No atomics are required: on a single core, the interrupt runs
+   * to completion before `poll()` resumes.
+   */
+  class bus_event_queue : public bus_event_callback
   {
-    m_enumerated = false;
-    co_await m_ctrl_ep->connect(p_context, true);
-    co_await pass_host_event_to_interfaces(p_context, host_event::reset);
+  public:
+    void callback(bus_event p_event) noexcept override
+    {
+      u8 const head = m_head;
+      auto const next = static_cast<u8>((head + 1) % capacity);
+      if (next == m_tail) {
+        m_overflowed = true;
+        return;
+      }
+      m_events[head] = p_event;
+      m_head = next;
+    }
+
+    [[nodiscard]] std::optional<bus_event> pop() noexcept
+    {
+      u8 const tail = m_tail;
+      if (tail == m_head) {
+        return std::nullopt;
+      }
+      bus_event const event = m_events[tail];
+      m_tail = static_cast<u8>((tail + 1) % capacity);
+      return event;
+    }
+
+    [[nodiscard]] bool take_overflow() noexcept
+    {
+      bool const overflowed = m_overflowed;
+      m_overflowed = false;
+      return overflowed;
+    }
+
+  private:
+    // One slot stays empty to tell a full queue from an empty one.
+    static constexpr u8 capacity = 8;
+    std::array<bus_event volatile, capacity> m_events{};
+    u8 volatile m_head = 0;
+    u8 volatile m_tail = 0;
+    bool volatile m_overflowed = false;
+  };
+
+  void check_retry_limit()
+  {
+    if (m_retry_counter >= m_info.retry_max) {
+      m_retry_counter = 0;
+      throw hal::io_error(this);
+    }
   }
 
-  hal::task pass_host_event_to_interfaces(async::context& p_context,
-                                           host_event p_event)
+  void handle_bus_event(bus_event p_event)
+  {
+    switch (p_event) {
+      case hal::usb::bus_event::reset:
+        handle_reset();
+        break;
+      case hal::usb::bus_event::setup_packet:
+        handle_setup_packet();
+        break;
+      case hal::usb::bus_event::data_packet:
+        break;
+      case hal::usb::bus_event::resume:
+        pass_host_event_to_interfaces(host_event::resume);
+        break;
+      case hal::usb::bus_event::suspend: {
+        bool const wakeup_granted = m_ctrl_ep->remote_wakeup_granted();
+        if (wakeup_granted) {
+          pass_host_event_to_interfaces(host_event::suspend_with_wakeup);
+        } else {
+          pass_host_event_to_interfaces(host_event::suspend_without_wakeup);
+        }
+        break;
+      }
+      case hal::usb::bus_event::sleep:
+        pass_host_event_to_interfaces(host_event::sleep);
+        break;
+      case hal::usb::bus_event::u1_sleep:
+        pass_host_event_to_interfaces(host_event::u1_sleep);
+        break;
+      case hal::usb::bus_event::u2_sleep:
+        pass_host_event_to_interfaces(host_event::u2_sleep);
+        break;
+    }
+  }
+
+  void handle_reset()
+  {
+    m_enumerated = false;
+    m_ctrl_ep->connect(true);
+    pass_host_event_to_interfaces(host_event::reset);
+  }
+
+  void pass_host_event_to_interfaces(host_event p_event)
   {
     for (auto& iface : m_interfaces) {
-      co_await iface->handle_host_event(p_context, p_event);
+      iface->handle_host_event(p_event);
     }
   }
 
@@ -402,20 +474,17 @@ private:
     {
     }
 
-    async::future<usize> driver_read(async::context& p_context,
-                                      mem::scatter_span<byte> p_buffer) override
+    usize driver_read(mem::scatter_span<byte> p_buffer) override
     {
-      return m_ctrl_ep->read(p_context, p_buffer);
+      return m_ctrl_ep->read(p_buffer);
     }
 
-    async::future<usize> driver_write(
-      async::context& p_context,
-      mem::scatter_span<byte const> p_buffer) override
+    usize driver_write(mem::scatter_span<byte const> p_buffer) override
     {
       // TODO(#99): Add code to limit the amount of data transmitted and
       // return the amount actually written.
-      co_await m_ctrl_ep->write(p_context, p_buffer);
-      co_return p_buffer.length();
+      m_ctrl_ep->write(p_buffer);
+      return p_buffer.length();
     }
 
     hal::ptr<control_endpoint> m_ctrl_ep;
@@ -423,96 +492,81 @@ private:
 
   struct size_eio : endpoint_io
   {
-    async::future<usize> driver_read(async::context&,
-                                      mem::scatter_span<byte>) override
+    usize driver_read(mem::scatter_span<byte>) override
     {
-      return async::future<usize>(0);
+      return 0;
     }
 
-    async::future<usize> driver_write(
-      async::context&,
-      mem::scatter_span<byte const> p_buffer) override
+    usize driver_write(mem::scatter_span<byte const> p_buffer) override
     {
       auto const length = p_buffer.length();
       total_length += length;
-      return async::future<usize>(length);
+      return length;
     }
 
     usize total_length = 0;
   };
 
-  hal::task handle_setup_packet(async::context& p_context)
+  void handle_setup_packet()
   {
     setup_packet request;
-    auto const bytes_read = co_await m_ctrl_ep->read(
-      p_context,
-      mem::scatter_span<hal::byte>{ std::span<hal::byte>(
-        request.raw_request_bytes) });
+    auto const bytes_read = m_ctrl_ep->read(mem::scatter_span<hal::byte>{
+      std::span<hal::byte>(request.raw_request_bytes) });
 
     if (bytes_read != 8) {
       // STATUS OUT ZLP or malformed - not a SETUP packet, STALL
-      co_await send_error_to_host(p_context);
-      co_return;
+      send_error_to_host();
+      return;
     }
 
-    co_await dispatch_setup_packet(p_context, request);
+    dispatch_setup_packet(request);
   }
 
-  // Not a coroutine: every branch hands off to exactly one async call and
-  // does nothing else, so this can return that call's future directly
-  // instead of paying for its own coroutine frame/resume state to just
-  // await and immediately finish.
-  hal::task dispatch_setup_packet(async::context& p_context,
-                                   setup_packet& p_request)
+  void dispatch_setup_packet(setup_packet& p_request)
   {
     switch (p_request.get_recipient()) {
       case setup_packet::request_recipient::invalid:
-        return send_error_to_host(p_context);
+        send_error_to_host();
+        return;
 
       case setup_packet::request_recipient::device:
-        return handle_standard_device_request(p_context, p_request);
+        handle_standard_device_request(p_request);
+        return;
 
       case setup_packet::request_recipient::interface:
         [[fallthrough]];
       case setup_packet::request_recipient::endpoint:
-        return handle_interface_request(p_context, p_request);
+        handle_interface_request(p_request);
+        return;
     }
-
-    return {};
   }
 
-  hal::task handle_interface_request(async::context& p_context,
-                                      setup_packet p_request)
+  void handle_interface_request(setup_packet p_request)
   {
     enumerator_eio eio(*this);
     bool request_handled = false;
 
     for (auto const& iface : m_interfaces) {
-      request_handled = co_await iface->handle_request(p_context, p_request, eio);
+      request_handled = iface->handle_request(p_request, eio);
       if (request_handled) {
         break;
       }
     }
 
     if (!request_handled) {
-      co_await send_error_to_host(p_context);
+      send_error_to_host();
     }
 
-    co_await m_ctrl_ep->write(p_context, {});
+    m_ctrl_ep->write({});
   }
 
-  // The increment is reordered ahead of the stall so this can tail-forward
-  // its future directly. Behaviorally equivalent even if stall() throws -
-  // run() only ever exits by propagating an exception, so nothing ever
-  // reads m_retry_counter again once that happens either way.
-  hal::task send_error_to_host(async::context& p_context)
+  void send_error_to_host()
   {
+    m_ctrl_ep->stall(true);
     m_retry_counter += 1;
-    return m_ctrl_ep->stall(p_context, true);
   }
 
-  hal::task handle_standard_device_request(async::context& p_context,
-                                            setup_packet& p_request)
+  void handle_standard_device_request(setup_packet& p_request)
   {
     enum struct feature : u8
     {
@@ -523,51 +577,47 @@ private:
     auto const request = determine_standard_request(p_request);
     switch (request) {
       case standard_request_types::set_address: {
-        co_await m_ctrl_ep->write(p_context, {});  // ZLP must precede the
-                                                    // address change
-        co_await m_ctrl_ep->set_address(p_context, p_request.value_bytes()[0]);
-        co_return;
+        m_ctrl_ep->write({});  // ZLP must precede the
+                               // address change
+        m_ctrl_ep->set_address(p_request.value_bytes()[0]);
+        return;
       }
 
       case standard_request_types::get_descriptor: {
-        co_await send_requested_descriptor(p_context, p_request);
+        send_requested_descriptor(p_request);
         break;
       }
 
       case standard_request_types::get_configuration: {
         auto const payload = std::to_array<byte const, 1>({ 1 });
-        co_await write_and_flush(
-          p_context, *m_ctrl_ep, std::span<byte const>(payload));
+        write_and_flush(*m_ctrl_ep, std::span<byte const>(payload));
         break;
       }
 
       case standard_request_types::set_configuration: {
         m_enumerated = true;
-        co_await pass_host_event_to_interfaces(p_context,
-                                                hal::usb::host_event::enumerated);
-        co_await m_ctrl_ep->write(p_context, {});
+        pass_host_event_to_interfaces(hal::usb::host_event::enumerated);
+        m_ctrl_ep->write({});
         break;
       }
 
       case hal::usb::standard_request_types::get_status: {
-        bool const wakeup_granted =
-          co_await m_ctrl_ep->remote_wakeup_granted(p_context);
-        byte const status = static_cast<byte>((m_info.self_powered << 0) |
-                                              (wakeup_granted << 1));
+        bool const wakeup_granted = m_ctrl_ep->remote_wakeup_granted();
+        byte const status =
+          static_cast<byte>((m_info.self_powered << 0) | (wakeup_granted << 1));
         auto const payload = std::to_array<byte const, 2>({ status, 0 });
-        co_await write_and_flush(
-          p_context, *m_ctrl_ep, std::span<byte const>(payload));
+        write_and_flush(*m_ctrl_ep, std::span<byte const>(payload));
         break;
       }
 
       case standard_request_types::clear_feature: {
         auto const value = static_cast<feature>(p_request.value());
         if (value == feature::device_remote_wakeup) {
-          co_await m_ctrl_ep->remote_wakeup_enable(p_context, false);
-          co_await m_ctrl_ep->write(p_context, {});
+          m_ctrl_ep->remote_wakeup_enable(false);
+          m_ctrl_ep->write({});
           break;
         }
-        co_await m_ctrl_ep->stall(p_context, true);
+        m_ctrl_ep->stall(true);
         break;
       }
       case standard_request_types::set_feature: {
@@ -575,16 +625,16 @@ private:
         auto const lpm = m_ctrl_ep->supports_lpm();
         if (value == feature::device_remote_wakeup and m_info.remote_wakeup and
             lpm.remote_wakeup_supported()) {
-          co_await m_ctrl_ep->remote_wakeup_enable(p_context, true);
-          co_await m_ctrl_ep->write(p_context, {});
+          m_ctrl_ep->remote_wakeup_enable(true);
+          m_ctrl_ep->write({});
           break;
         }
-        co_await m_ctrl_ep->stall(p_context, true);
+        m_ctrl_ep->stall(true);
         break;
       }
       case standard_request_types::invalid:
       default:
-        co_await send_error_to_host(p_context);
+        send_error_to_host();
     }
   }
 
@@ -657,13 +707,11 @@ private:
    * @brief Prepare interfaces with their starting interface and starting
    * string number.
    *
-   * @param p_context - async context for coroutine suspension and
    * resumption.
-   * @return async::future<configuration_totals> - total length and
+   * @return configuration_totals - total length and
    * interface count
    */
-  async::future<configuration_totals> prepare_descriptors(
-    async::context& p_context)
+  configuration_totals prepare_descriptors()
   {
     // String indexes 1-3 are reserved for device descriptor strings
     // (manufacturer, product, serial number). Configuration strings start
@@ -675,8 +723,7 @@ private:
     size_eio size_counting_endpoint;
 
     for (auto const& iface : m_interfaces) {
-      auto [interface_count, string_count] = co_await iface->write_descriptors(
-        p_context,
+      auto [interface_count, string_count] = iface->write_descriptors(
         {
           .interface = cur_iface_index,
           .string = cur_str_index,
@@ -687,7 +734,7 @@ private:
       cur_str_index += string_count;
     }
 
-    co_return configuration_totals{
+    return configuration_totals{
       .length = static_cast<u16>(
         size_counting_endpoint.total_length +
         static_cast<u16>(constants::configuration_descriptor_size)),
@@ -732,8 +779,7 @@ private:
     return descriptor;
   }
 
-  hal::task send_requested_descriptor(async::context& p_context,
-                                       setup_packet& p_request)
+  void send_requested_descriptor(setup_packet& p_request)
   {
     auto const type = static_cast<descriptor_type>(p_request.value_bytes()[1]);
 
@@ -743,21 +789,21 @@ private:
         auto const length =
           std::min<usize>(p_request.length(), descriptor.size());
         auto const payload = std::span(descriptor).first(length);
-        co_await write_and_flush(p_context, *m_ctrl_ep, payload);
+        write_and_flush(*m_ctrl_ep, payload);
         break;
       }
 
       case descriptor_type::configuration: {
-        auto const total_size = co_await prepare_descriptors(p_context);
+        auto const total_size = prepare_descriptors();
         auto const descriptor = generate_configuration_descriptor(total_size);
         auto const length =
           std::min<usize>(p_request.length(), descriptor.size());
         auto const payload = std::span(descriptor).first(length);
-        co_await write(p_context, *m_ctrl_ep, payload);
+        write(*m_ctrl_ep, payload);
 
         if (p_request.length() <= constants::configuration_descriptor_size) {
-          co_await m_ctrl_ep->write(p_context, {});  // ZLP to finish
-          co_return;
+          m_ctrl_ep->write({});  // ZLP to finish
+          return;
         }
 
         {
@@ -767,19 +813,17 @@ private:
           // should simply do nothing and return early.
           enumerator_eio eio(*this);
           for (auto const& iface : m_interfaces) {
-            std::ignore = co_await iface->write_descriptors(
-              p_context,
-              { .interface = std::nullopt, .string = std::nullopt },
-              eio);
+            std::ignore = iface->write_descriptors(
+              { .interface = std::nullopt, .string = std::nullopt }, eio);
           }
         }
 
-        co_await m_ctrl_ep->write(p_context, {});  // ZLP to finish
+        m_ctrl_ep->write({});  // ZLP to finish
         break;
       }
 
       case descriptor_type::string: {
-        co_await handle_str_descriptors(p_context, p_request);
+        handle_str_descriptors(p_request);
         break;
       }
 
@@ -787,13 +831,12 @@ private:
         // TODO(#96): OTHER_SPEED_CONFIGURATION
 
       default: {
-        co_await send_error_to_host(p_context);
+        send_error_to_host();
       }
     }
   }
 
-  hal::task handle_str_descriptors(async::context& p_context,
-                                    setup_packet& p_request)
+  void handle_str_descriptors(setup_packet& p_request)
   {
     // Device strings are at fixed indexes: 1=manufacturer, 2=product,
     // 3=serial
@@ -816,45 +859,36 @@ private:
         });
         auto const payload_length = std::min<usize>(length, payload.size());
         auto const payload_span = std::span(payload).first(payload_length);
-        co_await write_and_flush(p_context, *m_ctrl_ep, payload_span);
-        co_return;
+        write_and_flush(*m_ctrl_ep, payload_span);
+        return;
       }
       case manufacturer_index: {
-        co_await write_string_view(p_context, m_info.manufacturer, length);
-        co_return;
+        write_string_view(m_info.manufacturer, length);
+        return;
       }
       case product_index: {
-        co_await write_string_view(p_context, m_info.product, length);
-        co_return;
+        write_string_view(m_info.product, length);
+        return;
       }
       case serial_number_index: {
-        co_await write_string_view(p_context, m_info.serial_number, length);
-        co_return;
+        write_string_view(m_info.serial_number, length);
+        return;
       }
       default: {
         enumerator_eio endpoint(*this);
         for (auto const& iface : m_interfaces) {
-          if (co_await iface->write_string_descriptor(
-                p_context, target, endpoint) == true) {
-            co_await m_ctrl_ep->write(p_context, {});
-            co_return;
+          if (iface->write_string_descriptor(target, endpoint) == true) {
+            m_ctrl_ep->write({});
+            return;
           }
         }
         break;
       }
     }
-    co_await send_error_to_host(p_context);
+    send_error_to_host();
   }
 
-  // TODO(#3): `header` below is a stack-local borrowed by `payload` across
-  // the co_await, which is what keeps this a coroutine (a whole ramp/resume
-  // /destroy triple for one tail call). Hoisting it to a member would let
-  // this collapse to `return write_and_flush(...);` - see issue for the
-  // one caveat to confirm first (the three call sites in
-  // handle_str_descriptors must not have overlapping in-flight uses of it).
-  hal::task write_string_view(async::context& p_context,
-                               std::u16string_view p_str,
-                               u16 p_max_length)
+  void write_string_view(std::u16string_view p_str, u16 p_max_length)
   {
     auto const string_view_as_bytes = hal::as_bytes(p_str);
     auto const length =
@@ -866,12 +900,13 @@ private:
     mem::scatter_array<hal::byte const, 2> full{ header, string_view_as_bytes };
     auto const payload = full.sub_scatter_span({ .count = p_max_length });
 
-    co_await write_and_flush(p_context, *m_ctrl_ep, payload);
+    write_and_flush(*m_ctrl_ep, payload);
   }
 
   hal::ptr<control_endpoint> m_ctrl_ep;
   std::span<hal::ptr<interface>> m_interfaces;
   info m_info;
+  bus_event_queue m_bus_events;
   u8 m_retry_counter = 0;
   bool m_enumerated = false;
 };
@@ -937,8 +972,7 @@ public:
   inplace_enumerator& operator=(inplace_enumerator&&) noexcept = default;
 
 private:
-  std::array<hal::ptr<hal::usb::interface>, InterfaceCount>
-    m_interface_storage;
+  std::array<hal::ptr<hal::usb::interface>, InterfaceCount> m_interface_storage;
 };
 
 export template<typename... Interfaces>

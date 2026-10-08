@@ -14,7 +14,6 @@
 
 module;
 
-#include <coroutine>
 #include <span>
 
 export module hal.usb:endpoints;
@@ -24,123 +23,97 @@ import hal;
 // TODO(#79): Add doxygen docs to USB APIs
 namespace hal::usb::inline v1 {
 
-export async::future<void> write(async::context& p_context,
-                                  control_endpoint& p_endpoint,
-                                  mem::scatter_span<hal::byte const> p_data_out)
+export void write(control_endpoint& p_endpoint,
+                  mem::scatter_span<hal::byte const> p_data_out)
 {
-  co_await p_endpoint.write(p_context, p_data_out);
+  p_endpoint.write(p_data_out);
 }
 
-export async::future<void> write_and_flush(
-  async::context& p_context,
-  control_endpoint& p_endpoint,
-  mem::scatter_span<hal::byte const> p_data_out)
+export void write_and_flush(control_endpoint& p_endpoint,
+                            mem::scatter_span<hal::byte const> p_data_out)
 {
-  co_await p_endpoint.write(p_context, p_data_out);
-  co_await p_endpoint.write(p_context, {});
+  p_endpoint.write(p_data_out);
+  p_endpoint.write({});
 }
 
-export async::future<void> write(async::context& p_context,
-                                  control_endpoint& p_endpoint,
-                                  std::span<hal::byte const> p_data_out)
+export void write(control_endpoint& p_endpoint,
+                  std::span<hal::byte const> p_data_out)
 {
-  co_await p_endpoint.write(p_context, mem::scatter_span<hal::byte const>{
-                                          p_data_out });
+  p_endpoint.write(mem::scatter_span<hal::byte const>{ p_data_out });
 }
 
-export async::future<void> write_and_flush(
-  async::context& p_context,
-  control_endpoint& p_endpoint,
-  std::span<hal::byte const> p_data_out)
+export void write_and_flush(control_endpoint& p_endpoint,
+                            std::span<hal::byte const> p_data_out)
 {
-  co_await p_endpoint.write(p_context, mem::scatter_span<hal::byte const>{
-                                          p_data_out });
-  co_await p_endpoint.write(p_context, {});
+  p_endpoint.write(mem::scatter_span<hal::byte const>{ p_data_out });
+  p_endpoint.write({});
 }
 
-export async::future<void> write(async::context& p_context,
-                                  in_endpoint& p_endpoint,
-                                  mem::scatter_span<hal::byte const> p_data_out)
+export void write(in_endpoint& p_endpoint,
+                  mem::scatter_span<hal::byte const> p_data_out)
 {
-  co_await p_endpoint.write(p_context, p_data_out);
+  p_endpoint.write(p_data_out);
 }
 
-export async::future<void> write_and_flush(
-  async::context& p_context,
-  in_endpoint& p_endpoint,
-  mem::scatter_span<hal::byte const> p_data_out)
+export void write_and_flush(in_endpoint& p_endpoint,
+                            mem::scatter_span<hal::byte const> p_data_out)
 {
-  co_await p_endpoint.write(p_context, p_data_out);
-  co_await p_endpoint.write(p_context, {});
+  p_endpoint.write(p_data_out);
+  p_endpoint.write({});
 }
 
-export async::future<void> write(async::context& p_context,
-                                  in_endpoint& p_endpoint,
-                                  std::span<hal::byte const> p_data_out)
+export void write(in_endpoint& p_endpoint,
+                  std::span<hal::byte const> p_data_out)
 {
-  co_await p_endpoint.write(p_context, mem::scatter_span<hal::byte const>{
-                                          p_data_out });
+  p_endpoint.write(mem::scatter_span<hal::byte const>{ p_data_out });
 }
 
-export async::future<void> write_and_flush(
-  async::context& p_context,
-  in_endpoint& p_endpoint,
-  std::span<hal::byte const> p_data_out)
+export void write_and_flush(in_endpoint& p_endpoint,
+                            std::span<hal::byte const> p_data_out)
 {
-  co_await p_endpoint.write(p_context, mem::scatter_span<hal::byte const>{
-                                          p_data_out });
-  co_await p_endpoint.write(p_context, {});
+  p_endpoint.write(mem::scatter_span<hal::byte const>{ p_data_out });
+  p_endpoint.write({});
 }
 
-export async::future<void> write(async::context& p_context,
-                                  in_endpoint& p_endpoint,
-                                  mem::spanable auto... p_data_out)
+export void write(in_endpoint& p_endpoint, mem::spanable auto... p_data_out)
 {
   mem::scatter_array<hal::byte const, sizeof...(p_data_out)> const data{
     p_data_out...
   };
-  co_await p_endpoint.write(p_context, data);
+  p_endpoint.write(data);
 }
 
-export async::future<void> write_and_flush(async::context& p_context,
-                                            in_endpoint& p_endpoint,
-                                            mem::spanable auto... p_data_out)
+export void write_and_flush(in_endpoint& p_endpoint,
+                            mem::spanable auto... p_data_out)
 {
   mem::scatter_array<hal::byte const, sizeof...(p_data_out)> const data{
     p_data_out...
   };
-  co_await p_endpoint.write(p_context, data);
-  co_await p_endpoint.write(p_context, {});
+  p_endpoint.write(data);
+  p_endpoint.write({});
 }
 
-export async::future<hal::usize> read(async::context& p_context,
-                                       out_endpoint& p_endpoint,
-                                       mem::scatter_span<hal::byte> p_data_in)
+export hal::usize read(out_endpoint& p_endpoint,
+                       mem::scatter_span<hal::byte> p_data_in)
 {
-  co_return co_await p_endpoint.read(p_context, p_data_in);
+  return p_endpoint.read(p_data_in);
 }
 
-export async::future<hal::usize> read(async::context& p_context,
-                                       out_endpoint& p_endpoint,
-                                       std::span<hal::byte> p_data_in)
+export hal::usize read(out_endpoint& p_endpoint, std::span<hal::byte> p_data_in)
 {
-  co_return co_await p_endpoint.read(
-    p_context, mem::scatter_span<hal::byte>{ p_data_in });
+  return p_endpoint.read(mem::scatter_span<hal::byte>{ p_data_in });
 }
 
-export async::future<hal::usize> read(async::context& p_context,
-                                       control_endpoint& p_endpoint,
-                                       mem::scatter_span<hal::byte> p_data_in)
+export hal::usize read(control_endpoint& p_endpoint,
+                       mem::scatter_span<hal::byte> p_data_in)
 {
-  co_return co_await p_endpoint.read(p_context, p_data_in);
+  return p_endpoint.read(p_data_in);
 }
 
-export async::future<hal::usize> read(async::context& p_context,
-                                       control_endpoint& p_endpoint,
-                                       std::span<hal::byte> p_data_in)
+export hal::usize read(control_endpoint& p_endpoint,
+                       std::span<hal::byte> p_data_in)
 {
-  co_return co_await p_endpoint.read(
-    p_context, mem::scatter_span<hal::byte>{ p_data_in });
+  return p_endpoint.read(mem::scatter_span<hal::byte>{ p_data_in });
 }
 
 }  // namespace hal::usb::inline v1
